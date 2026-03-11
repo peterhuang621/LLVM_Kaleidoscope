@@ -1,5 +1,10 @@
 #include <iostream>
+#include <map>
+#include <memory>
+#include <utility>
+#include <vector>
 
+//=== Lexer
 enum Token {
     tok_eof = -1,
 
@@ -68,6 +73,65 @@ static int get_tok() {
     LastChar = getchar();
     return ThisChar;
 }
+
+//=== AST
+class ExprAST {
+public:
+    virtual ~ExprAST() = default;
+};
+
+class NumberExprAST : public ExprAST {
+    double Val;
+
+public:
+    NumberExprAST(double val) : Val(val) {}
+};
+
+class VariableExprAST : public ExprAST {
+    std::string Name;
+
+public:
+    VariableExprAST(const std::string& name) : Name(name) {}
+};
+
+class BinaryExprAST : public ExprAST {
+    char Op;
+    std::unique_ptr<ExprAST> LHS, RHS;
+
+public:
+    BinaryExprAST(char op, std::unique_ptr<ExprAST> Lhs,
+                  std::unique_ptr<ExprAST> Rhs)
+        : Op(op), LHS(std::move(Lhs)), RHS(std::move(Rhs)) {}
+};
+
+class CallExprAST : public ExprAST {
+    std::string Callee;
+    std::vector<std::unique_ptr<ExprAST>> Args;
+
+public:
+    CallExprAST(const std::string& callee,
+                std::vector<std::unique_ptr<ExprAST>> args)
+        : Callee(callee), Args(args) {}
+};
+
+class PrototypeAST {
+    std::string Name;
+    std::vector<std::string> Args;
+
+public:
+    PrototypeAST(const std::string& name, std::vector<std::string> args)
+        : Name(name), Args(args) {}
+};
+
+class FunctionAST {
+    std::unique_ptr<PrototypeAST> Proto;
+    std::unique_ptr<ExprAST> Body;
+
+public:
+    FunctionAST(std::unique_ptr<PrototypeAST> proto,
+                std::unique_ptr<ExprAST> body)
+        : Proto(std::move(proto)), Body(std::move(body)) {}
+};
 
 int main(int argc, char const* argv[]) {
     int Tok;
