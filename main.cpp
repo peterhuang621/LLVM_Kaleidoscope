@@ -1,9 +1,24 @@
+#include <algorithm>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constant.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/Verifier.h"
+
+using namespace llvm;
 
 //=== Lexer
 enum Token {
@@ -79,6 +94,7 @@ static int get_tok() {
 class ExprAST {
 public:
     virtual ~ExprAST() = default;
+    virtual Value* codegen() = 0;
 };
 
 class NumberExprAST : public ExprAST {
@@ -86,6 +102,8 @@ class NumberExprAST : public ExprAST {
 
 public:
     NumberExprAST(double val) : Val(val) {}
+
+    Value* codegen() override;
 };
 
 class VariableExprAST : public ExprAST {
@@ -93,6 +111,8 @@ class VariableExprAST : public ExprAST {
 
 public:
     VariableExprAST(const std::string& name) : Name(name) {}
+
+    Value* codegen() override;
 };
 
 class BinaryExprAST : public ExprAST {
@@ -103,6 +123,8 @@ public:
     BinaryExprAST(char op, std::unique_ptr<ExprAST> Lhs,
                   std::unique_ptr<ExprAST> Rhs)
         : Op(op), LHS(std::move(Lhs)), RHS(std::move(Rhs)) {}
+
+    Value* codegen() override;
 };
 
 class CallExprAST : public ExprAST {
@@ -113,6 +135,8 @@ public:
     CallExprAST(const std::string& callee,
                 std::vector<std::unique_ptr<ExprAST>> args)
         : Callee(callee), Args(std::move(args)) {}
+
+    Value* codegen() override;
 };
 
 class PrototypeAST {
@@ -122,6 +146,8 @@ class PrototypeAST {
 public:
     PrototypeAST(const std::string& name, std::vector<std::string> args)
         : Name(name), Args(args) {}
+
+    Function* codegen();
 };
 
 class FunctionAST {
@@ -132,6 +158,8 @@ public:
     FunctionAST(std::unique_ptr<PrototypeAST> proto,
                 std::unique_ptr<ExprAST> body)
         : Proto(std::move(proto)), Body(std::move(body)) {}
+
+    Function* codegen();
 };
 
 //=== parser
@@ -304,6 +332,66 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
 static std::unique_ptr<PrototypeAST> ParseExtern() {
     getNextToken();
     return ParsePrototype();
+}
+
+//=== Codegen
+static std::unique_ptr<LLVMContext> TheContext;
+static std::unique_ptr<Module> TheModule;
+static std::unique_ptr<IRBuilder<>> Builder;
+static std::unordered_map<std::string, Value*> NamedValues;
+
+Value* LogErrorV(const char* Str) {
+    LogError(Str);
+    return nullptr;
+}
+
+Value* NumberExprAST::codegen() {
+    return ConstantFP::get(*TheContext, APFloat(Val));
+}
+
+Value* VariableExprAST::codegen() {
+    Value* V = NamedValues[Name];
+    if (!V) return LogErrorV("unknown variable name");
+    return V;
+}
+
+Value* BinaryExprAST::codegen() {
+    Value *L = LHS->codegen(), *R = RHS->codegen();
+    if (!L || !R) return nullptr;
+    switch (Op) {
+        case '+':
+            return Builder->CreateFAdd(L, R, "addtmp");
+        case '-':
+            return Builder->CreateFSub(L, R, "subtmp");
+        case '*':
+            return Builder->CreateFMul(L, R, "multmp");
+        case '<':
+            L = Builder->CreateFCmpOLT(L, R, "cmptmp");
+            return Builder->CreateUIToFP(L, Type::getDoubleTy(*TheContext),
+                                         "booltmp");
+        default:
+            return LogErrorV("invalid binary operator");
+    }
+}
+
+Value* CallExprAST::codegen() {
+    Function* CalleeF = TheModule->getFunction(Callee);
+    if (!CalleeF) return LogErrorV("unknown function referenced");
+    if (CalleeF->arg_size() != Args.size())
+        return LogErrorV("incorrect # arguments passed");
+    std::vector<Value*> ArgsV;
+    Value* TmpArg = nullptr;
+    for (unsigned i = 0, e = Args.size(); i != e; i++) {
+        TmpArg = Args[i]->codegen();
+        if (!TmpArg) return nullptr;
+        ArgsV.emplace_back(TmpArg);
+    }
+
+    return Builder->CreateCall(CalleeF, ArgsV, "calltmp");
+}
+
+Function* PrototypeAST::codegen() {
+    // std::vector<Type*> Doubles(Args.size(), Type::getDoubleTy(*TheContext));
 }
 
 //=== TopLevel
