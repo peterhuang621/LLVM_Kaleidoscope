@@ -15,8 +15,18 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/StandardInstrumentations.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
+#include "llvm/Transforms/Scalar/Reassociate.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
 
 using namespace llvm;
 
@@ -148,6 +158,9 @@ public:
         : Name(name), Args(args) {}
 
     Function* codegen();
+    std::string getName() {
+        return Name;
+    }
 };
 
 class FunctionAST {
@@ -340,6 +353,14 @@ static std::unique_ptr<Module> TheModule;
 static std::unique_ptr<IRBuilder<>> Builder;
 static std::unordered_map<std::string, Value*> NamedValues;
 
+static std::unique_ptr<FunctionPassManager> TheFPM;
+static std::unique_ptr<LoopAnalysisManager> TheLAM;
+static std::unique_ptr<FunctionAnalysisManager> TheFAM;
+static std::unique_ptr<CGSCCAnalysisManager> TheCGAM;
+static std::unique_ptr<ModuleAnalysisManager> TheMAM;
+static std::unique_ptr<PassInstrumentationCallbacks> ThePIC;
+static std::unique_ptr<StandardInstrumentations> TheSI;
+
 Value* LogErrorV(const char* Str) {
     LogError(Str);
     return nullptr;
@@ -391,28 +412,102 @@ Value* CallExprAST::codegen() {
 }
 
 Function* PrototypeAST::codegen() {
-    // std::vector<Type*> Doubles(Args.size(), Type::getDoubleTy(*TheContext));
+    std::vector<Type*> Doubles(Args.size(), Type::getDoubleTy(*TheContext));
+    FunctionType* FT =
+        FunctionType::get(Type::getDoubleTy(*TheContext), Doubles, false);
+    Function* F =
+        Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get());
+
+    unsigned Idx = 0;
+    for (auto& Arg : F->args()) Arg.setName(Args[Idx++]);
+    return F;
+}
+
+Function* FunctionAST::codegen() {
+    Function* TheFunction = TheModule->getFunction(Proto->getName());
+
+    if (!TheFunction) TheFunction = Proto->codegen();
+    if (!TheFunction) return nullptr;
+
+    BasicBlock* BB = BasicBlock::Create(*TheContext, "entry", TheFunction);
+    Builder->SetInsertPoint(BB);
+
+    NamedValues.clear();
+    for (auto& Arg : TheFunction->args())
+        NamedValues[std::string(Arg.getName())] = &Arg;
+
+    if (Value* RetVal = Body->codegen()) {
+        Builder->CreateRet(RetVal);
+        verifyFunction(*TheFunction);
+
+        TheFPM->run(*TheFunction, *TheFAM);
+
+        return TheFunction;
+    }
+
+    TheFunction->eraseFromParent();
+    return nullptr;
 }
 
 //=== TopLevel
+static void InitializeModuleAndManagers() {
+    TheContext = std::make_unique<LLVMContext>();
+    TheModule = std::make_unique<Module>("my cool jit", *TheContext);
+    Builder = std::make_unique<IRBuilder<>>(*TheContext);
+
+    TheFPM = std::make_unique<FunctionPassManager>();
+    TheLAM = std::make_unique<LoopAnalysisManager>();
+    TheFAM = std::make_unique<FunctionAnalysisManager>();
+    TheCGAM = std::make_unique<CGSCCAnalysisManager>();
+    TheMAM = std::make_unique<ModuleAnalysisManager>();
+    ThePIC = std::make_unique<PassInstrumentationCallbacks>();
+    TheSI = std::make_unique<StandardInstrumentations>(*TheContext, true);
+    TheSI->registerCallbacks(*ThePIC, TheMAM.get());
+
+    TheFPM->addPass(InstCombinePass());
+    TheFPM->addPass(ReassociatePass());
+    TheFPM->addPass(GVNPass());
+    TheFPM->addPass(SimplifyCFGPass());
+
+    PassBuilder PB;
+    PB.registerModuleAnalyses(*TheMAM);
+    PB.registerFunctionAnalyses(*TheFAM);
+    PB.crossRegisterProxies(*TheLAM, *TheFAM, *TheCGAM, *TheMAM);
+}
+
 static void HandleDefinition() {
-    if (ParseDefinition())
-        fprintf(stderr, "parsed a function definition.\n");
-    else
+    if (auto FnAST = ParseDefinition()) {
+        if (auto* FnIR = FnAST->codegen()) {
+            fprintf(stderr, "read function definition:");
+            FnIR->print(errs());
+            fprintf(stderr, "\n");
+        }
+    } else
         getNextToken();
 }
 
 static void HandleExtern() {
-    if (ParseExtern())
-        fprintf(stderr, "parsed an extern.\n");
-    else
+    if (auto ProtoAST = ParseExtern()) {
+        if (auto* FnIR = ProtoAST->codegen()) {
+            fprintf(stderr, "read extern");
+            FnIR->print(errs());
+            fprintf(stderr, "\n");
+        }
+    } else
         getNextToken();
 }
 
 static void HandleTopLevelExpression() {
-    if (ParseTopLevelExpr())
-        fprintf(stderr, "parsed a top-level expr.\n");
-    else
+    if (auto FnAST = ParseTopLevelExpr()) {
+        if (auto* FnIR = FnAST->codegen()) {
+            fprintf(stderr, "read top=level expression:");
+            FnIR->print(errs());
+            fprintf(stderr, "\n");
+
+            // remove the anonymous expression
+            FnIR->eraseFromParent();
+        }
+    } else
         getNextToken();
 }
 
@@ -450,7 +545,11 @@ int main(int argc, char const* argv[]) {
     fprintf(stderr, "ready> ");
     getNextToken();
 
+    InitializeModuleAndManagers();
+
     MainLoop();
+
+    TheModule->print(errs(), nullptr);
 
     return 0;
 }
