@@ -14,6 +14,7 @@
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instruction.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
@@ -42,7 +43,12 @@ enum Token {
 
     // primary
     tok_identifier = -4,
-    tok_number = -5
+    tok_number = -5,
+
+    // control
+    tok_if = -6,
+    tok_then = -7,
+    tok_else = -8
 };
 
 static std::string IdentifierStr;
@@ -66,6 +72,9 @@ static int get_tok() {
         // keyword
         if (IdentifierStr == "def") return tok_def;
         if (IdentifierStr == "extern") return tok_extern;
+        if (IdentifierStr == "if") return tok_if;
+        if (IdentifierStr == "then") return tok_then;
+        if (IdentifierStr == "else") return tok_else;
 
         // identifier
         return tok_identifier;
@@ -147,6 +156,17 @@ public:
     CallExprAST(const std::string& callee,
                 std::vector<std::unique_ptr<ExprAST>> args)
         : Callee(callee), Args(std::move(args)) {}
+
+    Value* codegen() override;
+};
+
+class IfExprAST : public ExprAST {
+    std::unique_ptr<ExprAST> Cond, Then, Else;
+
+public:
+    IfExprAST(std::unique_ptr<ExprAST> cond, std::unique_ptr<ExprAST> then,
+              std::unique_ptr<ExprAST> Else)
+        : Cond(std::move(cond)), Then(std::move(then)), Else(std::move(Else)) {}
 
     Value* codegen() override;
 };
@@ -254,10 +274,34 @@ static std::unique_ptr<ExprAST> ParseIdentifierExpr() {
     return std::make_unique<CallExprAST>(IdName, std::move(Args));
 }
 
+// ifexpr ::= 'if' expression 'then' expression 'else' expression
+static std::unique_ptr<ExprAST> ParseIfExpr() {
+    getNextToken();
+
+    auto Cond = ParseExpression();
+    if (!Cond) return nullptr;
+
+    if (CurTok != tok_then) return LogError("expected then");
+    getNextToken();
+
+    auto Then = ParseExpression();
+    if (!Then) return nullptr;
+
+    if (CurTok != tok_else) return LogError("expected else");
+    getNextToken();
+
+    auto Else = ParseExpression();
+    if (!Else) return nullptr;
+
+    return std::make_unique<IfExprAST>(std::move(Cond), std::move(Then),
+                                       std::move(Else));
+}
+
 //=== primary
 // ::= identifier
 // ::= numberexpr
 // ::= parenexpr
+// ::= ifexpr
 static std::unique_ptr<ExprAST> ParsePrimary() {
     switch (CurTok) {
         case tok_identifier:
@@ -266,6 +310,8 @@ static std::unique_ptr<ExprAST> ParsePrimary() {
             return ParseNumberExpr();
         case '(':
             return ParseParenExpr();
+        case tok_if:
+            return ParseIfExpr();
         default:
             return LogError("unknown token when expecting an expression");
     }
@@ -427,6 +473,45 @@ Value* CallExprAST::codegen() {
     return Builder->CreateCall(CalleeF, ArgsV, "calltmp");
 }
 
+Value* IfExprAST::codegen() {
+    Value* CondV = Cond->codegen();
+    if (!Cond) return nullptr;
+
+    CondV = Builder->CreateFCmpONE(
+        CondV, ConstantFP::get(*TheContext, APFloat(0.0)), "ifcond");
+    Function* TheFunction = Builder->GetInsertBlock()->getParent();
+
+    BasicBlock* ThenBB = BasicBlock::Create(*TheContext, "then", TheFunction);
+    BasicBlock* ElseBB = BasicBlock::Create(*TheContext, "else");
+    BasicBlock* MergeBB = BasicBlock::Create(*TheContext, "ifcont");
+
+    Builder->CreateCondBr(CondV, ThenBB, ElseBB);
+
+    Builder->SetInsertPoint(ThenBB);
+    Value* ThenV = Then->codegen();
+    if (!ThenV) return nullptr;
+
+    Builder->CreateBr(MergeBB);
+    ThenBB = Builder->GetInsertBlock();
+
+    TheFunction->insert(TheFunction->end(), ElseBB);
+    Builder->SetInsertPoint(ElseBB);
+    Value* ElseV = Else->codegen();
+    if (!ElseV) return nullptr;
+
+    Builder->CreateBr(MergeBB);
+    ElseBB = Builder->GetInsertBlock();
+
+    TheFunction->insert(TheFunction->end(), MergeBB);
+    Builder->SetInsertPoint(MergeBB);
+    PHINode* PN =
+        Builder->CreatePHI(Type::getDoubleTy(*TheContext), 2, "iftmp");
+
+    PN->addIncoming(ThenV, ThenBB);
+    PN->addIncoming(ElseV, ElseBB);
+    return PN;
+}
+
 Function* PrototypeAST::codegen() {
     std::vector<Type*> Doubles(Args.size(), Type::getDoubleTy(*TheContext));
     FunctionType* FT =
@@ -531,7 +616,7 @@ static void HandleTopLevelExpression() {
             ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
             InitializeModuleAndManagers();
 
-            auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anno_expr"));
+            auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anon_expr"));
             double (*FP)() = ExprSymbol.toPtr<double (*)()>();
             fprintf(stderr, "Evaluated to %f\n", FP());
 
@@ -601,6 +686,7 @@ int main(int argc, char const* argv[]) {
         cantFail(llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
             TheJIT->getDataLayout().getGlobalPrefix()));
     TheJIT->getMainJITDylib().addGenerator(std::move(G));
+
     InitializeModuleAndManagers();
 
     MainLoop();
