@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+#include "include/KaleidoscopeJIT.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
@@ -29,6 +30,7 @@
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
 
 using namespace llvm;
+using namespace llvm::orc;
 
 //=== Lexer
 enum Token {
@@ -361,8 +363,22 @@ static std::unique_ptr<ModuleAnalysisManager> TheMAM;
 static std::unique_ptr<PassInstrumentationCallbacks> ThePIC;
 static std::unique_ptr<StandardInstrumentations> TheSI;
 
+static std::unique_ptr<KaleidoscopeJIT> TheJIT;
+static ExitOnError ExitOnErr;
+static std::unordered_map<std::string, std::unique_ptr<PrototypeAST>>
+    FunctionProtos;
+
 Value* LogErrorV(const char* Str) {
     LogError(Str);
+    return nullptr;
+}
+
+Function* getFunction(const std::string& Name) {
+    if (auto* F = TheModule->getFunction(Name)) return F;
+
+    auto FI = FunctionProtos.find(Name);
+    if (FI != FunctionProtos.end()) return FI->second->codegen();
+
     return nullptr;
 }
 
@@ -396,7 +412,7 @@ Value* BinaryExprAST::codegen() {
 }
 
 Value* CallExprAST::codegen() {
-    Function* CalleeF = TheModule->getFunction(Callee);
+    Function* CalleeF = getFunction(Callee);
     if (!CalleeF) return LogErrorV("unknown function referenced");
     if (CalleeF->arg_size() != Args.size())
         return LogErrorV("incorrect # arguments passed");
@@ -424,7 +440,9 @@ Function* PrototypeAST::codegen() {
 }
 
 Function* FunctionAST::codegen() {
-    Function* TheFunction = TheModule->getFunction(Proto->getName());
+    auto& P = *Proto;
+    FunctionProtos[Proto->getName()] = std::move(Proto);
+    Function* TheFunction = getFunction(P.getName());
 
     if (!TheFunction) TheFunction = Proto->codegen();
     if (!TheFunction) return nullptr;
@@ -452,7 +470,8 @@ Function* FunctionAST::codegen() {
 //=== TopLevel
 static void InitializeModuleAndManagers() {
     TheContext = std::make_unique<LLVMContext>();
-    TheModule = std::make_unique<Module>("my cool jit", *TheContext);
+    TheModule = std::make_unique<Module>("Kaleidoscope", *TheContext);
+    TheModule->setDataLayout(TheJIT->getDataLayout());
     Builder = std::make_unique<IRBuilder<>>(*TheContext);
 
     TheFPM = std::make_unique<FunctionPassManager>();
@@ -481,6 +500,10 @@ static void HandleDefinition() {
             fprintf(stderr, "read function definition:");
             FnIR->print(errs());
             fprintf(stderr, "\n");
+
+            ExitOnErr(TheJIT->addModule(
+                ThreadSafeModule(std::move(TheModule), std::move(TheContext))));
+            InitializeModuleAndManagers();
         }
     } else
         getNextToken();
@@ -492,6 +515,8 @@ static void HandleExtern() {
             fprintf(stderr, "read extern");
             FnIR->print(errs());
             fprintf(stderr, "\n");
+
+            FunctionProtos[ProtoAST->getName()] = std::move(ProtoAST);
         }
     } else
         getNextToken();
@@ -499,13 +524,18 @@ static void HandleExtern() {
 
 static void HandleTopLevelExpression() {
     if (auto FnAST = ParseTopLevelExpr()) {
-        if (auto* FnIR = FnAST->codegen()) {
-            fprintf(stderr, "read top=level expression:");
-            FnIR->print(errs());
-            fprintf(stderr, "\n");
+        if (FnAST->codegen()) {
+            auto RT = TheJIT->getMainJITDylib().createResourceTracker();
+            auto TSM =
+                ThreadSafeModule(std::move(TheModule), std::move(TheContext));
+            ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
+            InitializeModuleAndManagers();
 
-            // remove the anonymous expression
-            FnIR->eraseFromParent();
+            auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anno_expr"));
+            double (*FP)() = ExprSymbol.toPtr<double (*)()>();
+            fprintf(stderr, "Evaluated to %f\n", FP());
+
+            ExitOnErr(RT->remove());
         }
     } else
         getNextToken();
@@ -534,8 +564,29 @@ static void MainLoop() {
     }
 }
 
+//=== JITLib
+#ifdef _WIN32
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
+
+extern "C" DLLEXPORT double putchard(double X) {
+    fputc((char)X, stderr);
+    return 0;
+}
+
+extern "C" DLLEXPORT double printd(double X) {
+    fprintf(stderr, "%f\n", X);
+    return 0;
+}
+
 //=== Driver
 int main(int argc, char const* argv[]) {
+    InitializeNativeTarget();
+    InitializeNativeTargetAsmPrinter();
+    InitializeNativeTargetAsmParser();
+
     BinopPrecedence['<'] = 10;
     BinopPrecedence['+'] = 20;
     BinopPrecedence['-'] = 20;
@@ -545,6 +596,11 @@ int main(int argc, char const* argv[]) {
     fprintf(stderr, "ready> ");
     getNextToken();
 
+    TheJIT = ExitOnErr(KaleidoscopeJIT::Create());
+    auto G =
+        cantFail(llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+            TheJIT->getDataLayout().getGlobalPrefix()));
+    TheJIT->getMainJITDylib().addGenerator(std::move(G));
     InitializeModuleAndManagers();
 
     MainLoop();
