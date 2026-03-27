@@ -152,7 +152,7 @@ class UnaryExprAST : public ExprAST {
 
 public:
     UnaryExprAST(char opcode, std::unique_ptr<ExprAST> operand)
-        : Opcode(std::move(opcode)), Operand(std::move(operand)) {}
+        : Opcode(opcode), Operand(std::move(operand)) {}
 
     Value* codegen() override;
 };
@@ -587,6 +587,16 @@ Value* VariableExprAST::codegen() {
     return V;
 }
 
+Value* UnaryExprAST::codegen() {
+    Value* OperandV = Operand->codegen();
+    if (!OperandV) return nullptr;
+
+    Function* F = getFunction(std::string("unary") + Opcode);
+    if (!F) return LogErrorV("Unknow unary operator");
+
+    return Builder->CreateCall(F, OperandV, "unop");
+}
+
 Value* BinaryExprAST::codegen() {
     Value *L = LHS->codegen(), *R = RHS->codegen();
     if (!L || !R) return nullptr;
@@ -597,13 +607,21 @@ Value* BinaryExprAST::codegen() {
             return Builder->CreateFSub(L, R, "subtmp");
         case '*':
             return Builder->CreateFMul(L, R, "multmp");
+        case '/':
+            return Builder->CreateFDiv(L, R, "divtmp");
         case '<':
             L = Builder->CreateFCmpOLT(L, R, "cmptmp");
             return Builder->CreateUIToFP(L, Type::getDoubleTy(*TheContext),
                                          "booltmp");
         default:
-            return LogErrorV("invalid binary operator");
+            break;
     }
+
+    Function* F = getFunction(std::string("binary") + Op);
+    assert(F && "binary operator not found!");
+
+    Value* Ops[] = {L, R};
+    return Builder->CreateCall(F, Ops, "binop");
 }
 
 Value* CallExprAST::codegen() {
@@ -624,7 +642,7 @@ Value* CallExprAST::codegen() {
 
 Value* IfExprAST::codegen() {
     Value* CondV = Cond->codegen();
-    if (!Cond) return nullptr;
+    if (!CondV) return nullptr;
 
     CondV = Builder->CreateFCmpONE(
         CondV, ConstantFP::get(*TheContext, APFloat(0.0)), "ifcond");
@@ -695,7 +713,7 @@ Value* ForExprAST::codegen() {
     if (!EndCond) return nullptr;
 
     EndCond = Builder->CreateFCmpONE(
-        EndCond, ConstantFP::get(*TheContext, APFloat(1.0)), "loopcond");
+        EndCond, ConstantFP::get(*TheContext, APFloat(0.0)), "loopcond");
 
     BasicBlock* LoopEndBB = Builder->GetInsertBlock();
     BasicBlock* AfterBB =
@@ -734,6 +752,8 @@ Function* FunctionAST::codegen() {
     if (!TheFunction) TheFunction = Proto->codegen();
     if (!TheFunction) return nullptr;
 
+    if (P.isBinaryOp())
+        BinopPrecedence[P.getOperatorName()] = P.getBinaryPrecedence();
     BasicBlock* BB = BasicBlock::Create(*TheContext, "entry", TheFunction);
     Builder->SetInsertPoint(BB);
 
@@ -751,6 +771,7 @@ Function* FunctionAST::codegen() {
     }
 
     TheFunction->eraseFromParent();
+    if (P.isBinaryOp()) BinopPrecedence.erase(P.getOperatorName());
     return nullptr;
 }
 
